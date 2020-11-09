@@ -101,6 +101,12 @@ function update_calendar() {
       let upcomingEvent = null;
       const now = Date.now();
 
+      if ( ! data.items ) {
+        // TODO: Save the error code?
+        lib.log(LOG_WARNING, "No data from Google Calendar");
+        return;
+      }
+        
       data.items.forEach(item => {
         // If an event is currently happening we want to check whether
         // that's what people are here for. Similarly, if an event is
