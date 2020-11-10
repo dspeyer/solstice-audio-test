@@ -1,3 +1,7 @@
 Files manually updated here may be used as backing tracks
 
 All files should be saved as mono wav at 48kHz
+
+To convert audio to this format, use:
+
+    ffmpeg -i /path/filename.mp3 -ac 1 -ar 48000 filename.wav
