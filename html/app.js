@@ -69,10 +69,6 @@ lib.log(LOG_INFO, "Starting up");
 
 const myUserid = Math.round(Math.random()*100000000000)
 
-function close_stream(stream) {
-  stream.getTracks().forEach((track) => track.stop());
-}
-
 function prettyTime(ms) {
   if (ms < 1000) {
     return "0s";
@@ -596,275 +592,6 @@ async function start_stop() {
   } else {
     lib.log(LOG_WARNING, "Pressed start/stop button while not stopped or running; stopping by default.");
     await stop();
-  }
-}
-
-class AudioEncoder {
-  constructor(path) {
-    this.worker = new Worker(path);
-    this.client_clock = null;
-    this.server_clock = null;
-    this.next_request_id = 0;
-    this.request_queue = [];
-    this.worker.onmessage = this.handle_message.bind(this);
-  }
-
-  handle_message(ev) {
-    if (ev.data?.type === 'exception') {
-      throw ev.data.exception;
-    }
-    var queue_entry = this.request_queue.shift();
-    var response_id = ev.data.request_id;
-    check(queue_entry[0] == response_id, "Responses out of order", queue_entry, ev.data);
-    if (ev.data.status != 0) {
-      throw new Error("AudioEncoder RPC failed: " + JSON.stringify(ev.data));
-    }
-    queue_entry[1](ev.data);
-  }
-
-  async worker_rpc(msg, transfer) {
-    var request_id = this.next_request_id;
-    var _this = this;
-    this.next_request_id += 1;
-    return new Promise(function (resolve, _) {
-      _this.request_queue.push([request_id, resolve]);
-      lib.log(LOG_VERYSPAM, "Posting to port", _this.worker, "msg", msg, "transfer", transfer);
-      _this.worker.postMessage({ request_id, ...msg }, transfer);
-    });
-  }
-
-  // MUST be called before ANY other RPCs
-  async setup(cfg) {
-    this.client_clock_reference = new ClientClockReference({
-      sample_rate: cfg.sampling_rate
-    });
-    this.server_clock_reference = new ServerClockReference({
-      sample_rate: cfg.codec_sampling_rate || 48000  // keep in sync with encoder.js
-    })
-    this.queued_chunk = null;
-    return this.worker_rpc(cfg);
-  }
-
-  async encode_chunk(chunk) {
-    chunk.check_clock_reference(this.client_clock_reference);
-    check(this.client_clock === null || !(chunk instanceof PlaceholderChunk), "Can't send placeholder chunks once clock has started");
-
-    if (this.queued_chunk !== null) {
-      chunk = concat_chunks([this.queued_chunk, chunk]);
-      this.queued_chunk = null;
-    }
-
-    if (chunk instanceof PlaceholderChunk) {
-      var result_length = Math.round(chunk.length / this.client_clock_reference.sample_rate * this.server_clock_reference.sample_rate);
-      var opus_samples = OPUS_FRAME_MS * this.server_clock_reference.sample_rate / 1000;
-      var send_length = Math.round(result_length / opus_samples) * opus_samples;
-
-      // This is ugly.
-      var leftover_length = Math.round((result_length - send_length) * this.client_clock_reference.sample_rate / this.server_clock_reference.sample_rate);
-      if (leftover_length > 0) {
-        this.queued_chunk = new PlaceholderChunk({
-          reference: this.client_clock_reference,
-          length: leftover_length
-        });
-      }
-
-      return new PlaceholderChunk({
-        reference: this.server_clock_reference,
-        length: send_length
-      });
-    }
-
-    if (this.client_clock === null) {
-      this.client_clock = chunk.start;
-
-      // This isn't ideal, but the notion is that we only do this once, so there is no accumulating rounding error.
-      this.server_clock = Math.round(this.client_clock
-        / this.client_clock_reference.sample_rate
-        * this.server_clock_reference.sample_rate);
-    }
-    if (this.client_clock != chunk.start) {
-      throw new Error("Cannot encode non-contiguous chunks!");
-    }
-    this.client_clock = chunk.end;
-
-    var { packets, samples_encoded, buffered_samples } = await this.encode({
-      samples: chunk.data
-    });
-
-    this.server_clock += samples_encoded
-    // At this point server_clock is behind chunk.end by buffered_samples, the amount of stuff remaining buffered inside the encoder worker
-    var server_clock_adjusted = this.server_clock + buffered_samples;
-    var client_clock_hypothetical = server_clock_adjusted / this.server_clock_reference.sample_rate * this.client_clock_reference.sample_rate;
-
-    // XXX: we'll see about this? I believe as long as the resampler is buffering correctly, this should never exceed 1, and should not be subject to accumulated roundoff error.
-    // NOTE: We have to use chunk.end here, and not this.client_clock, which may have moved on while we were waiting for the decoder.
-    lib.log(LOG_SPAM, "net sample rate clock error:", chunk.end - client_clock_hypothetical);
-    if (Math.abs(chunk.end - client_clock_hypothetical) > 5 /* arbitrary */) {
-      lib.log(LOG_WARNING, "Sample rate clock slippage excessive in encoder; why is this happening?", chunk.end, client_clock_hypothetical, this.server_clock, buffered_samples, server_clock_adjusted, this.server_clock_reference.sample_rate, this.client_clock_reference.sample_rate);
-      // TODO: Is this error always spurious? What should we do here, or how should we prevent it?
-      // throw new Error("sample rate clock slippage excessive; what happened?");
-    }
-
-    var enc_buf = [];
-    packets.forEach((packet) => {
-      enc_buf.push(new Uint8Array(packet.data));
-    });
-    var outdata = pack_multi(enc_buf);
-
-    var result_interval = new ClockInterval({
-      reference: this.server_clock_reference,
-      end: this.server_clock,
-      length: samples_encoded
-    });
-    return new CompressedAudioChunk({
-      interval: result_interval,
-      data: outdata
-    });
-  }
-
-  async encode(in_data) {
-    var data = await this.worker_rpc(in_data);
-    if (data.packets === undefined) {
-      throw new Error("encode returned no packets:" + JSON.stringify(data));
-    }
-    return data;
-  }
-
-  // XXX: should probably drain the queue?
-  async reset() {
-    this.client_clock = null;
-    this.server_clock = null;
-    return this.worker_rpc({
-      reset: true
-    });
-  }
-}
-
-class AudioDecoder {
-  constructor(path) {
-    this.worker = new Worker(path);
-    this.server_clock = null;
-    this.client_clock = null;
-    this.next_request_id = 0;
-    this.request_queue = [];
-    this.worker.onmessage = this.handle_message.bind(this);
-  }
-
-  handle_message(ev) {
-    if (ev.data?.type === 'exception') {
-      throw ev.data.exception;
-    }
-    var queue_entry = this.request_queue.shift();
-    var response_id = ev.data.request_id;
-    check(queue_entry[0] == response_id, "Responses out of order", queue_entry, ev.data);
-    if (ev.data.status != 0) {
-      throw new Error("AudioDecoder RPC failed: " + JSON.stringify(ev.data));
-    }
-    queue_entry[1](ev.data);
-  }
-
-  async worker_rpc(msg, transfer) {
-    var request_id = this.next_request_id;
-    var _this = this;
-    this.next_request_id += 1;
-    return new Promise(function (resolve, _) {
-      _this.request_queue.push([request_id, resolve]);
-      lib.log(LOG_VERYSPAM, "Posting to port", _this.worker, "msg", msg, "transfer", transfer);
-      _this.worker.postMessage({ request_id, ...msg }, transfer);
-    });
-  }
-
-  // MUST be called before ANY other RPCs
-  async setup(cfg) {
-    this.client_clock_reference = new ClientClockReference({
-      sample_rate: cfg.sampling_rate
-    });
-    this.server_clock_reference = new ServerClockReference({
-      sample_rate: cfg.codec_sampling_rate || 48000  // keep in sync with decoder.js
-    })
-    return this.worker_rpc(cfg);
-  }
-
-  // XXX: should probably drain the queue?
-  async reset() {
-    this.client_clock = null;
-    this.server_clock = null;
-    return this.worker_rpc({
-      reset: true
-    });
-  }
-
-  async decode_chunk(chunk) {
-    chunk.check_clock_reference(this.server_clock_reference);
-
-    if (chunk instanceof PlaceholderChunk) {
-      var result_interval = new ClockInterval({
-        reference: this.client_clock_reference,
-        length: Math.round(chunk.length / this.server_clock_reference.sample_rate * this.client_clock_reference.sample_rate),
-        end: Math.round(chunk.end / this.server_clock_reference.sample_rate * this.client_clock_reference.sample_rate),
-      });
-      // Wrap this in a promise so that it resolves asynchronously and does not return "too fast".
-      // XXX doesn't help
-      return Promise.resolve(new PlaceholderChunk({
-        reference: result_interval.reference,
-        length: result_interval.length,
-        interval: result_interval
-      }));
-    }
-
-    if (this.server_clock === null) {
-      this.server_clock = chunk.start;
-
-      // This isn't ideal, but the notion is that we only do this once, so there is no accumulating rounding error.
-      this.client_clock = Math.round(this.server_clock
-        / this.server_clock_reference.sample_rate
-        * this.client_clock_reference.sample_rate);
-    }
-    if (this.server_clock != chunk.start) {
-      throw new Error("Cannot decode non-contiguous chunks!");
-    }
-    this.server_clock = chunk.end;
-
-    var indata = chunk.data;
-    var packets = unpack_multi(indata);
-
-    // Make all the calls FIRST, and THEN gather the results. This will prevent us from interleaving with other calls to decode_chunk. (Assuming certain things about in-order dispatch and delivery of postMessage, which I hope are true.)
-    lib.log(LOG_VERYSPAM, "Starting to decode sample packets", packets);
-    var decoding_promises = [];
-    for (var i = 0; i < packets.length; ++i) {
-      decoding_promises.push(decoder.decode({
-        data: packets[i].buffer
-      }));
-    }
-
-    lib.log(LOG_VERYSPAM, "Forcing decoding promises", decoding_promises);
-    var decoded_packets = [];
-    for (var i = 0; i < decoding_promises.length; ++i) {
-      var p_samples = await decoding_promises[i];
-      lib.log(LOG_VERYSPAM, "Decoded samples:", p_samples);
-      decoded_packets.push(new Float32Array(p_samples.samples));
-    }
-
-    var play_samples = concat_typed_arrays(decoded_packets, Float32Array);
-    var decoded_length_expected = chunk.length / chunk.reference.sample_rate * this.client_clock_reference.sample_rate;
-    // XXX: This is janky, in reality our chunk length divides evenly so it should be 0, if it doesn't I'm not sure what we should expect here?
-    check(Math.abs(decoded_length_expected - play_samples.length) < 5, "Chunk decoded to wrong length!", chunk, play_samples);
-    this.client_clock += play_samples.length;
-    lib.log(LOG_SPAM, "Decoded all samples from server:", decoded_packets);
-
-    var result_interval = new ClockInterval({
-      reference: this.client_clock_reference,
-      end: this.client_clock,
-      length: play_samples.length
-    });
-    return new AudioChunk({
-      interval: result_interval,
-      data: play_samples
-    });
-  }
-
-  async decode(packet) {
-    return await this.worker_rpc(packet, [packet.data]);
   }
 }
 
@@ -1758,3 +1485,276 @@ document.querySelectorAll("#tutorial_questions button").forEach(
   (button) => button.addEventListener("click", () => tutorial_answer(button)));
 
 initialize();
+
+class AudioEncoder {
+  constructor(path) {
+    this.worker = new Worker(path);
+    this.client_clock = null;
+    this.server_clock = null;
+    this.next_request_id = 0;
+    this.request_queue = [];
+    this.worker.onmessage = this.handle_message.bind(this);
+  }
+
+  handle_message(ev) {
+    if (ev.data?.type === 'exception') {
+      throw ev.data.exception;
+    }
+    var queue_entry = this.request_queue.shift();
+    var response_id = ev.data.request_id;
+    check(queue_entry[0] == response_id, "Responses out of order", queue_entry, ev.data);
+    if (ev.data.status != 0) {
+      throw new Error("AudioEncoder RPC failed: " + JSON.stringify(ev.data));
+    }
+    queue_entry[1](ev.data);
+  }
+
+  async worker_rpc(msg, transfer) {
+    var request_id = this.next_request_id;
+    var _this = this;
+    this.next_request_id += 1;
+    return new Promise(function (resolve, _) {
+      _this.request_queue.push([request_id, resolve]);
+      lib.log(LOG_VERYSPAM, "Posting to port", _this.worker, "msg", msg, "transfer", transfer);
+      _this.worker.postMessage({ request_id, ...msg }, transfer);
+    });
+  }
+
+  // MUST be called before ANY other RPCs
+  async setup(cfg) {
+    this.client_clock_reference = new ClientClockReference({
+      sample_rate: cfg.sampling_rate
+    });
+    this.server_clock_reference = new ServerClockReference({
+      sample_rate: cfg.codec_sampling_rate || 48000  // keep in sync with encoder.js
+    })
+    this.queued_chunk = null;
+    return this.worker_rpc(cfg);
+  }
+
+  async encode_chunk(chunk) {
+    chunk.check_clock_reference(this.client_clock_reference);
+    check(this.client_clock === null || !(chunk instanceof PlaceholderChunk), "Can't send placeholder chunks once clock has started");
+
+    if (this.queued_chunk !== null) {
+      chunk = concat_chunks([this.queued_chunk, chunk]);
+      this.queued_chunk = null;
+    }
+
+    if (chunk instanceof PlaceholderChunk) {
+      var result_length = Math.round(chunk.length / this.client_clock_reference.sample_rate * this.server_clock_reference.sample_rate);
+      var opus_samples = OPUS_FRAME_MS * this.server_clock_reference.sample_rate / 1000;
+      var send_length = Math.round(result_length / opus_samples) * opus_samples;
+
+      // This is ugly.
+      var leftover_length = Math.round((result_length - send_length) * this.client_clock_reference.sample_rate / this.server_clock_reference.sample_rate);
+      if (leftover_length > 0) {
+        this.queued_chunk = new PlaceholderChunk({
+          reference: this.client_clock_reference,
+          length: leftover_length
+        });
+      }
+
+      return new PlaceholderChunk({
+        reference: this.server_clock_reference,
+        length: send_length
+      });
+    }
+
+    if (this.client_clock === null) {
+      this.client_clock = chunk.start;
+
+      // This isn't ideal, but the notion is that we only do this once, so there is no accumulating rounding error.
+      this.server_clock = Math.round(this.client_clock
+        / this.client_clock_reference.sample_rate
+        * this.server_clock_reference.sample_rate);
+    }
+    if (this.client_clock != chunk.start) {
+      throw new Error("Cannot encode non-contiguous chunks!");
+    }
+    this.client_clock = chunk.end;
+
+    var { packets, samples_encoded, buffered_samples } = await this.encode({
+      samples: chunk.data
+    });
+
+    this.server_clock += samples_encoded
+    // At this point server_clock is behind chunk.end by buffered_samples, the amount of stuff remaining buffered inside the encoder worker
+    var server_clock_adjusted = this.server_clock + buffered_samples;
+    var client_clock_hypothetical = server_clock_adjusted / this.server_clock_reference.sample_rate * this.client_clock_reference.sample_rate;
+
+    // XXX: we'll see about this? I believe as long as the resampler is buffering correctly, this should never exceed 1, and should not be subject to accumulated roundoff error.
+    // NOTE: We have to use chunk.end here, and not this.client_clock, which may have moved on while we were waiting for the decoder.
+    lib.log(LOG_SPAM, "net sample rate clock error:", chunk.end - client_clock_hypothetical);
+    if (Math.abs(chunk.end - client_clock_hypothetical) > 5 /* arbitrary */) {
+      lib.log(LOG_WARNING, "Sample rate clock slippage excessive in encoder; why is this happening?", chunk.end, client_clock_hypothetical, this.server_clock, buffered_samples, server_clock_adjusted, this.server_clock_reference.sample_rate, this.client_clock_reference.sample_rate);
+      // TODO: Is this error always spurious? What should we do here, or how should we prevent it?
+      // throw new Error("sample rate clock slippage excessive; what happened?");
+    }
+
+    var enc_buf = [];
+    packets.forEach((packet) => {
+      enc_buf.push(new Uint8Array(packet.data));
+    });
+    var outdata = pack_multi(enc_buf);
+
+    var result_interval = new ClockInterval({
+      reference: this.server_clock_reference,
+      end: this.server_clock,
+      length: samples_encoded
+    });
+    return new CompressedAudioChunk({
+      interval: result_interval,
+      data: outdata
+    });
+  }
+
+  async encode(in_data) {
+    var data = await this.worker_rpc(in_data);
+    if (data.packets === undefined) {
+      throw new Error("encode returned no packets:" + JSON.stringify(data));
+    }
+    return data;
+  }
+
+  // XXX: should probably drain the queue?
+  async reset() {
+    this.client_clock = null;
+    this.server_clock = null;
+    return this.worker_rpc({
+      reset: true
+    });
+  }
+}
+
+function close_stream(stream) {
+  stream.getTracks().forEach((track) => track.stop());
+}
+
+class AudioDecoder {
+  constructor(path) {
+    this.worker = new Worker(path);
+    this.server_clock = null;
+    this.client_clock = null;
+    this.next_request_id = 0;
+    this.request_queue = [];
+    this.worker.onmessage = this.handle_message.bind(this);
+  }
+
+  handle_message(ev) {
+    if (ev.data?.type === 'exception') {
+      throw ev.data.exception;
+    }
+    var queue_entry = this.request_queue.shift();
+    var response_id = ev.data.request_id;
+    check(queue_entry[0] == response_id, "Responses out of order", queue_entry, ev.data);
+    if (ev.data.status != 0) {
+      throw new Error("AudioDecoder RPC failed: " + JSON.stringify(ev.data));
+    }
+    queue_entry[1](ev.data);
+  }
+
+  async worker_rpc(msg, transfer) {
+    var request_id = this.next_request_id;
+    var _this = this;
+    this.next_request_id += 1;
+    return new Promise(function (resolve, _) {
+      _this.request_queue.push([request_id, resolve]);
+      lib.log(LOG_VERYSPAM, "Posting to port", _this.worker, "msg", msg, "transfer", transfer);
+      _this.worker.postMessage({ request_id, ...msg }, transfer);
+    });
+  }
+
+  // MUST be called before ANY other RPCs
+  async setup(cfg) {
+    this.client_clock_reference = new ClientClockReference({
+      sample_rate: cfg.sampling_rate
+    });
+    this.server_clock_reference = new ServerClockReference({
+      sample_rate: cfg.codec_sampling_rate || 48000  // keep in sync with decoder.js
+    })
+    return this.worker_rpc(cfg);
+  }
+
+  // XXX: should probably drain the queue?
+  async reset() {
+    this.client_clock = null;
+    this.server_clock = null;
+    return this.worker_rpc({
+      reset: true
+    });
+  }
+
+  async decode_chunk(chunk) {
+    chunk.check_clock_reference(this.server_clock_reference);
+
+    if (chunk instanceof PlaceholderChunk) {
+      var result_interval = new ClockInterval({
+        reference: this.client_clock_reference,
+        length: Math.round(chunk.length / this.server_clock_reference.sample_rate * this.client_clock_reference.sample_rate),
+        end: Math.round(chunk.end / this.server_clock_reference.sample_rate * this.client_clock_reference.sample_rate),
+      });
+      // Wrap this in a promise so that it resolves asynchronously and does not return "too fast".
+      // XXX doesn't help
+      return Promise.resolve(new PlaceholderChunk({
+        reference: result_interval.reference,
+        length: result_interval.length,
+        interval: result_interval
+      }));
+    }
+
+    if (this.server_clock === null) {
+      this.server_clock = chunk.start;
+
+      // This isn't ideal, but the notion is that we only do this once, so there is no accumulating rounding error.
+      this.client_clock = Math.round(this.server_clock
+        / this.server_clock_reference.sample_rate
+        * this.client_clock_reference.sample_rate);
+    }
+    if (this.server_clock != chunk.start) {
+      throw new Error("Cannot decode non-contiguous chunks!");
+    }
+    this.server_clock = chunk.end;
+
+    var indata = chunk.data;
+    var packets = unpack_multi(indata);
+
+    // Make all the calls FIRST, and THEN gather the results. This will prevent us from interleaving with other calls to decode_chunk. (Assuming certain things about in-order dispatch and delivery of postMessage, which I hope are true.)
+    lib.log(LOG_VERYSPAM, "Starting to decode sample packets", packets);
+    var decoding_promises = [];
+    for (var i = 0; i < packets.length; ++i) {
+      decoding_promises.push(decoder.decode({
+        data: packets[i].buffer
+      }));
+    }
+
+    lib.log(LOG_VERYSPAM, "Forcing decoding promises", decoding_promises);
+    var decoded_packets = [];
+    for (var i = 0; i < decoding_promises.length; ++i) {
+      var p_samples = await decoding_promises[i];
+      lib.log(LOG_VERYSPAM, "Decoded samples:", p_samples);
+      decoded_packets.push(new Float32Array(p_samples.samples));
+    }
+
+    var play_samples = concat_typed_arrays(decoded_packets, Float32Array);
+    var decoded_length_expected = chunk.length / chunk.reference.sample_rate * this.client_clock_reference.sample_rate;
+    // XXX: This is janky, in reality our chunk length divides evenly so it should be 0, if it doesn't I'm not sure what we should expect here?
+    check(Math.abs(decoded_length_expected - play_samples.length) < 5, "Chunk decoded to wrong length!", chunk, play_samples);
+    this.client_clock += play_samples.length;
+    lib.log(LOG_SPAM, "Decoded all samples from server:", decoded_packets);
+
+    var result_interval = new ClockInterval({
+      reference: this.client_clock_reference,
+      end: this.client_clock,
+      length: play_samples.length
+    });
+    return new AudioChunk({
+      interval: result_interval,
+      data: play_samples
+    });
+  }
+
+  async decode(packet) {
+    return await this.worker_rpc(packet, [packet.data]);
+  }
+}
